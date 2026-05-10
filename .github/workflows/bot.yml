@@ -8,17 +8,28 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: pip install -r requirements.txt
 
-      - name: Create .env file
-        run: echo "${{ secrets.ENV_FILE }}" > .env
+      - name: Create .env File
+        run: |
+          cat > .env << 'EOF'
+          ${{ secrets.ENV_FILE }}
+          EOF
+
+      - name: Verify .env File
+        run: |
+          echo ".env created successfully"
+          ls -la
+          grep -E "^(BOT_TOKEN|CHAT_ID|GROQ_API_KEY)=" .env | sed 's/=.*$/=***HIDDEN***/'
 
       - name: Run Bot
         run: python aq_telegram_bot.py
