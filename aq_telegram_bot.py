@@ -1423,7 +1423,8 @@ def fmt_full_analysis(ticker, dd, lead, lag, sig, fund, pats,
                       fib, supports, resistances, mtf, ai_text, pos,
                       regime_detail, liquidity_ok, liquidity_msg,
                       earnings_risk, earnings_msg, gap_risk, gap_msg,
-                      blocked, block_reasons, timeframe="Daily"):
+                      blocked, block_reasons, timeframe="Daily",
+                      rs_pct=None, rs_out=False, rs_label=""):
     cs  = fund.get("cs","")
     c   = sig["entry"]
     prev= float(dd["Close"].iloc[-2]) if len(dd)>1 else c
@@ -1465,7 +1466,7 @@ def fmt_full_analysis(ticker, dd, lead, lag, sig, fund, pats,
 
     # Caution block — first thing after signal
     cb=caution_block(lead["score"],lag["score"],regime_str,
-                     earnings_risk,liq_ok,blocked,block_reasons)
+                     earnings_risk,liquidity_ok,blocked,block_reasons)
     if cb: lines+=[cb,""]
 
     # MTF warning
@@ -1545,7 +1546,7 @@ def fmt_full_analysis(ticker, dd, lead, lag, sig, fund, pats,
         "━━━ RISK ASSESSMENT ━━━",
         f"🌍 Market: {regime_detail[:90]}",
         f"📊 Relative strength: {rs_label or '—'}",
-        f"💧 Liquidity: {liq_msg}",
+        f"💧 Liquidity: {liquidity_msg}",
         f"📅 Earnings: {earnings_msg}",
         f"⚡ Gap risk: {gap_msg}",
         f"🎯 Min score to act in {regime_str} market: {min_act}/100",
@@ -1881,6 +1882,7 @@ def run_full_analysis(chat_id, ticker, timeframe="1d", tf_label="Daily"):
         fib, sh, sl_f            = fibonacci_levels(dd)
         supports, resistances    = find_sr_levels(dd)
         pats                     = candle_patterns(dd, n_bars=14)
+        rs_pct, rs_out, rs_label = get_relative_strength(ticker, lookback_days=30)
 
         # 6. Portfolio risk
         sector = fund.get("sector","—")
@@ -2431,9 +2433,10 @@ def signal_validation_monitor():
                                 outcome="EXPIRED"; expired+=1
                             else:
                                 outcome="RUNNING"
+                            outcome_date = ist.strftime("%Y-%m-%d")
                             con.execute(
                                 "UPDATE signal_log SET outcome=?,outcome_date=? WHERE id=?",
-                                (outcome,nd,sid))
+                                (outcome,outcome_date,sid))
                         except: pass
                     con.commit()
                     con.close()
