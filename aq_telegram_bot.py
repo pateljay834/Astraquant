@@ -1,4 +1,4 @@
-“””
+"""
 ╔══════════════════════════════════════════════════════════════════════╗
 ║  AstraQuant Telegram Bot  v3.0 — Real Money Edition                  ║
 ║                                                                      ║
@@ -19,7 +19,7 @@
 ║  • Gap risk assessment (recent gap history, corporate actions)       ║
 ║  • Honest probability (show sample size, confidence level)           ║
 ╚══════════════════════════════════════════════════════════════════════╝
-“””
+"""
 import os, json, logging, math, sqlite3, time, threading, io
 import warnings; warnings.filterwarnings(“ignore”)
 from datetime import datetime, timedelta
