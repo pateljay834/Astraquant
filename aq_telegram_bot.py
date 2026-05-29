@@ -773,6 +773,13 @@ def build_signal(df, lead, lag, ticker="", regime=None, weekly_lag=None):
     # ── Trade levels — smart SL ───────────────────────────────────
     actionable = signal in ("PRIME LONG","LONG","EARLY SETUP","TREND RIDE")
     entry = round(c, 2)
+
+    # Volume confirmation — require at least 0.8x average on signal day
+    # Signals on unusually low volume are less reliable
+    vol_  = rv(r,"Volume"); volma_ = rv(r,"VolMA")
+    vol_ratio = round(float(vol_)/float(volma_),2) if vol_ and volma_ and volma_>0 else 1.0
+    vol_confirmed = vol_ratio >= 0.8
+
     # Regime adjusts risk per trade and SL tightness
     regime_risk_pct = {"bull": RISK_PER_TRADE,
                        "neutral": RISK_PER_TRADE * 0.75,
@@ -818,18 +825,31 @@ def build_signal(df, lead, lag, ticker="", regime=None, weekly_lag=None):
         "regime_note":regime_note,
         "regime":regime_str,
         "regime_score":regime_score,
-        "regime_risk_pct":regime_risk_pct if actionable else RISK_PER_TRADE,
-        "min_score_to_act":min_act,
+        "regime_risk_pct": regime_risk_pct if actionable else RISK_PER_TRADE,
+        "min_score_to_act": min_act,
+        "vol_ratio":        round(vol_ratio,2),
+        "vol_confirmed":    vol_confirmed,
     }
 
 # ══════════════════════════════════════════════════════════════════════
 # DATA FETCHING
 # ══════════════════════════════════════════════════════════════════════
 def fetch_df(ticker, days=600, interval="1d"):
+    """Fetch with 3 retries on network failure."""
     end   = datetime.today() + timedelta(days=1)
     start = end - timedelta(days=days+1)
-    df    = yf.Ticker(ticker).history(start=start,end=end,
-                interval=interval,auto_adjust=True)
+    last_err = None
+    for attempt in range(3):
+        try:
+            df = yf.Ticker(ticker).history(start=start,end=end,
+                     interval=interval,auto_adjust=True)
+            if not df.empty:
+                break
+        except Exception as e:
+            last_err = e
+            time.sleep(2**attempt)  # exponential backoff: 1s, 2s, 4s
+    else:
+        raise ValueError(f"Failed after 3 attempts: {last_err}")
     if df.empty:
         sfx = get_exchange_suffix(ticker)
         if sfx in (".NS",".BO"):
@@ -1005,26 +1025,25 @@ def check_portfolio_risk(ticker, sector):
 # MULTI-TIMEFRAME CONSENSUS
 # ══════════════════════════════════════════════════════════════════════
 def multi_timeframe_consensus(ticker):
-    results={}
-    for tf,label in [("1wk","Weekly"),("1mo","Monthly")]:
-        try:
-            df   = fetch_and_score(ticker, interval=tf)
-            lead = leading_score(df)
-            lag  = lagging_score(df)
-            sig  = build_signal(df, lead, lag)
-            results[label]={"signal":sig["signal"],"lead":lead["score"],
-                            "lag":lag["score"],"emoji":sig["emoji"],
-                            "lag_obj":lag}
-        except Exception as e:
-            log.warning(f"MTF {tf} failed for {ticker}: {e}")
-            results[label]=None
-
-    signals=[v["signal"] for v in results.values() if v]
-    bullish =sum(1 for s in signals if s in
-                 ("PRIME LONG","LONG","EARLY SETUP","TREND RIDE"))
-    consensus=("🟢 All timeframes bullish" if bullish==len(signals) and bullish>0 else
-               "🟡 Mixed timeframes — trade smaller" if 0<bullish<len(signals) else
-               "🔴 Higher timeframes bearish — avoid new longs")
+    """Weekly only — monthly removed (too slow, rarely different outcome)."""
+    results = {}
+    try:
+        df   = fetch_and_score(ticker, interval="1wk")
+        lead = leading_score(df)
+        lag  = lagging_score(df)
+        sig  = build_signal(df, lead, lag)
+        results["Weekly"] = {"signal":sig["signal"],"lead":lead["score"],
+                             "lag":lag["score"],"emoji":sig["emoji"],
+                             "lag_obj":lag}
+    except Exception as e:
+        log.warning(f"MTF weekly failed for {ticker}: {e}")
+        results["Weekly"] = None
+    wk = results.get("Weekly")
+    if not wk:
+        return results, "⚪ Weekly data unavailable"
+    bullish = wk["signal"] in ("PRIME LONG","LONG","EARLY SETUP","TREND RIDE")
+    consensus = ("🟢 Weekly trend bullish" if bullish
+                 else "🔴 Weekly trend bearish — consider smaller size")
     return results, consensus
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1396,13 +1415,16 @@ def setup_status(ls, gs, sig):
     if ls>=50 or  gs>=50: return "👀 PARTIAL SIGNALS — not ready for entry. Monitor daily."
     return "❌ NO SETUP — both scores below 50. Do NOT enter. Scores shown for information only."
 
-def caution_block(ls, gs, regime, earnings_risk, liquidity_ok, blocked, block_reasons):
+def caution_block(ls, gs, regime, earnings_risk, liq_ok,
+                  blocked, block_reasons, vol_confirmed=True):
     lines=[]
     if blocked:
         lines.append("🚨 *TRADE BLOCKED BY PORTFOLIO RULES:*")
         for r in block_reasons: lines.append(f"  {r}")
-    if not liquidity_ok:
+    if not liq_ok:
         lines.append("🚨 *LIQUIDITY INSUFFICIENT* — stock too illiquid to trade safely")
+    if not vol_confirmed:
+        lines.append("⚠️ *LOW VOLUME TODAY* — signal on below-average volume, reduced conviction")
     if earnings_risk:
         lines.append("🚨 *EARNINGS BLACKOUT* — do not enter before earnings announcement")
     if regime=="bear":
@@ -1466,7 +1488,8 @@ def fmt_full_analysis(ticker, dd, lead, lag, sig, fund, pats,
 
     # Caution block — first thing after signal
     cb=caution_block(lead["score"],lag["score"],regime_str,
-                     earnings_risk,liquidity_ok,blocked,block_reasons)
+                     earn_risk,liq_ok,blocked,block_reasons,
+                     vol_confirmed=sig.get("vol_confirmed",True))
     if cb: lines+=[cb,""]
 
     # MTF warning
@@ -1546,7 +1569,7 @@ def fmt_full_analysis(ticker, dd, lead, lag, sig, fund, pats,
         "━━━ RISK ASSESSMENT ━━━",
         f"🌍 Market: {regime_detail[:90]}",
         f"📊 Relative strength: {rs_label or '—'}",
-        f"💧 Liquidity: {liquidity_msg}",
+        f"💧 Liquidity: {liq_msg}",
         f"📅 Earnings: {earnings_msg}",
         f"⚡ Gap risk: {gap_msg}",
         f"🎯 Min score to act in {regime_str} market: {min_act}/100",
@@ -1584,9 +1607,12 @@ def fmt_full_analysis(ticker, dd, lead, lag, sig, fund, pats,
     stoch=rv(r_,"STOCH_K"); willr=rv(r_,"WILLR"); cci=rv(r_,"CCI")
     rsi_v=rv(r_,"RSI"); adx_v=rv(r_,"ADX"); pp=rv(r_,"PP"); r1=rv(r_,"R1"); s1=rv(r_,"S1")
     sq=bool(rv(r_,"BB_sq")); rd=bool(rv(r_,"RSI_DIV")); md=bool(rv(r_,"MACD_DIV"))
+    vol_ratio  = sig.get("vol_ratio",1.0)
+    vol_conf   = sig.get("vol_confirmed",True)
+    vol_str    = f"Vol: {vol_ratio:.1f}× avg {'✅' if vol_conf else '⚠️ low'}"
     lines+=[
         "━━━ KEY INDICATORS ━━━",
-        f"RSI: {rsi_v:.1f}  │  ADX: {adx_v:.1f}  │  Stoch %K: {stoch:.0f}",
+        f"RSI: {rsi_v:.1f}  │  ADX: {adx_v:.1f}  │  Stoch %K: {stoch:.0f}  │  {vol_str}",
         f"Williams %R: {willr:.0f}  │  CCI: {cci:.0f}",
         f"Pivot: {cs}{pp:.2f}  │  R1: {cs}{r1:.2f}  │  S1: {cs}{s1:.2f}",
         f"{'⚡ BB SQUEEZE  ' if sq else ''}{'↑ RSI DIV  ' if rd else ''}{'↑ MACD DIV' if md else ''}".strip() or "No leading signals active",
@@ -1654,6 +1680,8 @@ NIFTY50=[
 
 def quick_screen_one(ticker, regime=None):
     try:
+        # Hard 45-second timeout per stock — screener cannot wait forever
+        import signal as _sig
         df   = fetch_and_score(ticker)
         lead = leading_score(df)
         lag  = lagging_score(df)
@@ -1662,21 +1690,22 @@ def quick_screen_one(ticker, regime=None):
         c    = float(rv(r,"Close")); pc=float(df["Close"].iloc[-2])
         liq_ok, liq_val, liq_msg = check_liquidity(df, ticker)
         sq   = bool(rv(r,"BB_sq")); rd=bool(rv(r,"RSI_DIV"))
-        rs_pct, rs_out, rs_lbl = get_relative_strength(ticker, lookback_days=30)
+        vol_ratio = sig.get("vol_ratio",1.0)
         return {
-            "ticker":  ticker, "price":round(c,2),
-            "chg":     round((c-pc)/pc*100,2),
-            "lead":    lead["score"], "lag":lag["score"],
-            "combined":sig["combined"],
-            "signal":  sig["signal"], "emoji":sig["emoji"],
-            "strategy":sig["strategy"],
-            "rsi":     round(float(rv(r,"RSI")),1),
-            "stoch":   round(float(rv(r,"STOCH_K")),1),
-            "adx":     round(float(rv(r,"ADX")),1),
-            "squeeze": sq, "rsi_div":rd,
-            "liquid":  liq_ok,
-            "regime_downgraded": sig["signal"]!=sig["raw_signal"],
-            "rs_pct":  rs_pct, "rs_out": rs_out,
+            "ticker":   ticker, "price":round(c,2),
+            "chg":      round((c-pc)/pc*100,2),
+            "lead":     lead["score"], "lag":lag["score"],
+            "combined": sig["combined"],
+            "signal":   sig["signal"], "emoji":sig["emoji"],
+            "strategy": sig["strategy"],
+            "rsi":      round(float(rv(r,"RSI")),1),
+            "stoch":    round(float(rv(r,"STOCH_K")),1),
+            "adx":      round(float(rv(r,"ADX")),1),
+            "squeeze":  sq, "rsi_div":rd,
+            "liquid":   liq_ok,
+            "vol_ratio":round(vol_ratio,2),
+            "regime_downgraded": sig["signal"]!=sig.get("raw_signal",sig["signal"]),
+            "rs_pct":   0, "rs_out": False,
         }
     except Exception as e:
         return {"ticker":ticker,"error":str(e)[:50]}
@@ -1855,17 +1884,19 @@ def run_full_analysis(chat_id, ticker, timeframe="1d", tf_label="Daily"):
         send_typing(chat_id)
         regime = get_market_regime(ticker)
 
-        # 3. Multi-timeframe (daily only to avoid recursion)
-        mtf = None
-        weekly_lag = None
+        # 3. Multi-timeframe — non-blocking thread with 20s timeout
+        mtf = None; weekly_lag = None
         if timeframe == "1d":
-            send(chat_id, "🔄 Checking weekly/monthly timeframes...")
-            try:
-                mtf = multi_timeframe_consensus(ticker)
-                wk  = mtf[0].get("Weekly")
+            mtf_result = [None]
+            def _run_mtf():
+                try: mtf_result[0] = multi_timeframe_consensus(ticker)
+                except Exception as e: log.warning(f"MTF failed {ticker}: {e}")
+            t_mtf = threading.Thread(target=_run_mtf, daemon=True)
+            t_mtf.start(); t_mtf.join(timeout=20)
+            mtf = mtf_result[0]
+            if mtf:
+                wk = mtf[0].get("Weekly") if mtf else None
                 if wk: weekly_lag = wk.get("lag_obj")
-            except Exception as e:
-                log.warning(f"MTF failed for {ticker}: {e}")
 
         # 4. Build signal with all filters
         sig = build_signal(dd, lead, lag,
@@ -1927,19 +1958,20 @@ def run_full_analysis(chat_id, ticker, timeframe="1d", tf_label="Daily"):
         send_photo(chat_id, buf, caption=caption)
 
     except Exception as e:
-        log.error(f"Analysis error {ticker} ({tf_label}): {e}", exc_info=True)
-        err=str(e)
-        hint=("\n\n_Weekly needs ~3 years of history. "
-              "Newly listed stocks may have insufficient data._"
-              if "Insufficient data" in err else
-              "\n\n_Check symbol at finance.yahoo.com. "
-              "Indian: add .NS (NSE) or .BO (BSE)_"
-              if "No data" in err else "")
-        send(chat_id, f"❌ {err}{hint}")
+        import traceback
+        log.error(f"Analysis error {ticker} ({tf_label}):\n{traceback.format_exc()}")
+        err = str(e)
+        if "Insufficient data" in err:
+            hint = "\n\n_Tip: Weekly needs ~3 years of history. Try /a for daily only._"
+        elif "No data" in err:
+            hint = "\n\n_Check symbol at finance.yahoo.com. Indian stocks: add .NS or .BO_"
+        else:
+            hint = ""
+        try:
+            send(chat_id, f"\u274c Analysis failed: {err[:200]}{hint}")
+        except Exception as se:
+            log.error(f"Cannot send error message: {se}")
 
-# ══════════════════════════════════════════════════════════════════════
-# COMMAND HANDLERS
-# ══════════════════════════════════════════════════════════════════════
 def cmd_analyse(chat_id, args):
     if not args:
         send(chat_id, "Usage: `/a TCS.NS` `/a AAPL` `/a 005930.KS`\n"
@@ -1966,7 +1998,7 @@ def cmd_screen(chat_id, args):
         elif al in ("reversal","trend_only","combined"): mode=al
         elif al=="global": pass
         else: custom.append(normalise_ticker(arg))
-    tickers = custom if custom else NIFTY50
+    tickers = custom if custom else get_watchlist()
     label   = f"{len(tickers)} custom tickers" if custom else "Nifty 50"
     # Show regime before screening
     regime  = get_market_regime("RELIANCE.NS")
@@ -1987,11 +2019,12 @@ def cmd_screen(chat_id, args):
         sq="⚡" if r.get("squeeze") else ""
         rd="↑" if r.get("rsi_div") else ""
         dg="↓" if r.get("regime_downgraded") else ""
-        rs_tag = "⭐RS+" if r.get("rs_out") else ""
+        rs_tag  = "⭐RS+" if r.get("rs_out") else ""
+        vol_tag = f"V:{r.get('vol_ratio',1.0):.1f}×" if r.get("vol_ratio",1.0)<0.8 else ""
         lines.append(
             f"{i}. *{r['ticker'].replace('.NS','')}* {r['emoji']} {r['signal']}{dg} {rs_tag}\n"
             f"   L:{r['lead']} G:{r['lag']} C:{r['combined']} │ "
-            f"{r['price']:,.2f} ({r['chg']:+.1f}%) {sq}{rd}\n"
+            f"{r['price']:,.2f} ({r['chg']:+.1f}%) {sq}{rd} {vol_tag}\n"
             f"   {r['strategy']}")
     if len(results)>15: lines.append(f"\n_+{len(results)-15} more_")
     if errors:         lines.append(f"\n_{len(errors)} symbols failed_")
@@ -2227,6 +2260,9 @@ Built as if trading with own capital.
 `/screen early`   — Early Setup signals
 `/screen prime`   — Prime Long only
 `/screen global AAPL MSFT NVDA` — custom list
+`/watchlist` `/wl` — view/manage screener watchlist
+`/wl add TCS.NS INFY` — add to watchlist
+`/wl clear` — reset to Nifty 50
 
 📐 *Tools*
 `/fib TCS.NS`          — Fibonacci retracement
@@ -2327,7 +2363,12 @@ def trailing_stop_monitor():
                     close_it = False
 
                     # SL hit
-                    effective_sl = t["trailing_sl"] or t["sl"]
+                    # Safe: trailing_sl > original sl > None
+                    effective_sl = (t.get("trailing_sl") or
+                                    t.get("sl") or
+                                    None)
+                    if effective_sl is not None:
+                        effective_sl = float(effective_sl)
                     if effective_sl and not t["sl_hit"] and cur <= effective_sl:
                         upd.update({"sl_hit":1,"status":"CLOSED",
                                     "exit_price":round(cur,2),"exit_date":nd})
@@ -2482,24 +2523,82 @@ def signal_validation_monitor():
 # ══════════════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ══════════════════════════════════════════════════════════════════════
+def get_watchlist():
+    """Return personal watchlist or Nifty 50 as fallback."""
+    wl_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.txt")
+    if os.path.exists(wl_file):
+        with open(wl_file) as f:
+            wl = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        if wl: return wl
+    return list(NIFTY50)
+
+def cmd_watchlist(chat_id, args):
+    """
+    /watchlist          — show current list
+    /watchlist add TCS  — add ticker(s)
+    /watchlist remove TCS — remove ticker
+    /watchlist clear    — reset to Nifty 50
+    """
+    wl_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.txt")
+
+    def load(): return get_watchlist()
+    def save(wl):
+        with open(wl_file, "w") as f:
+            for t in wl: f.write(t + "\n")
+
+    if not args:
+        wl = load()
+        chunks = [wl[i:i+25] for i in range(0, len(wl), 25)]
+        display = "  ".join(t.replace(".NS","").replace(".BO","") for t in wl[:25])
+        more = f"\n  _...+{len(wl)-25} more_" if len(wl)>25 else ""
+        send(chat_id,
+             f"*📋 Watchlist ({len(wl)} stocks)*\n\n{display}{more}\n\n"
+             "_/wl add TCS.NS_  |  _/wl remove TCS.NS_  |  _/wl clear_")
+        return
+
+    action  = args[0].lower()
+    tickers = [normalise_ticker(a) for a in args[1:] if a]
+
+    if action == "add" and tickers:
+        wl = load(); added = []
+        for t in tickers:
+            if t not in wl: wl.append(t); added.append(t)
+        save(wl)
+        send(chat_id, f"✅ Added: {', '.join(added) or 'already in list'}\n"
+                      f"Watchlist: {len(wl)} stocks")
+    elif action == "remove" and tickers:
+        wl = load()
+        removed = [t for t in tickers if t in wl]
+        wl = [t for t in wl if t not in tickers]
+        save(wl)
+        send(chat_id, f"✅ Removed: {', '.join(removed) or 'not found'}\n"
+                      f"Watchlist: {len(wl)} stocks")
+    elif action == "clear":
+        if os.path.exists(wl_file): os.remove(wl_file)
+        send(chat_id, f"✅ Reset to Nifty 50 ({len(NIFTY50)} stocks)")
+    else:
+        send(chat_id, "Usage:\n`/wl` — show list\n`/wl add TCS.NS INFY`\n"
+                      "`/wl remove TCS.NS`\n`/wl clear` — reset to Nifty 50")
+
 COMMANDS = {
-    "/analyse":  cmd_analyse,   "/a":       cmd_analyse,
-    "/weekly":   cmd_weekly,    "/w":       cmd_weekly,
-    "/both":     cmd_both,
-    "/screen":   cmd_screen,
-    "/log":      cmd_log,
-    "/size":     cmd_size,
-    "/fib":      cmd_fib,
-    "/trades":   cmd_trades,
-    "/close":    cmd_close,
-    "/trail":    cmd_trailing,
-    "/alert":    cmd_alert,
-    "/alerts":   cmd_alerts,
-    "/regime":   cmd_regime,
-    "/portfolio":cmd_portfolio,
-    "/status":   cmd_status,
-    "/help":     lambda cid,args: send(cid, HELP_TEXT),
-    "/start":    lambda cid,args: send(cid, HELP_TEXT),
+    "/analyse":   cmd_analyse,    "/a":        cmd_analyse,
+    "/weekly":    cmd_weekly,     "/w":        cmd_weekly,
+    "/both":      cmd_both,
+    "/screen":    cmd_screen,
+    "/watchlist": cmd_watchlist,  "/wl":       cmd_watchlist,
+    "/log":       cmd_log,
+    "/size":      cmd_size,
+    "/fib":       cmd_fib,
+    "/trades":    cmd_trades,
+    "/close":     cmd_close,
+    "/trail":     cmd_trailing,
+    "/alert":     cmd_alert,
+    "/alerts":    cmd_alerts,
+    "/regime":    cmd_regime,
+    "/portfolio": cmd_portfolio,
+    "/status":    cmd_status,
+    "/help":      lambda cid,args: send(cid, HELP_TEXT),
+    "/start":     lambda cid,args: send(cid, HELP_TEXT),
 }
 
 def process_update(upd):
