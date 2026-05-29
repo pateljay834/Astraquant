@@ -1662,6 +1662,7 @@ def quick_screen_one(ticker, regime=None):
         c    = float(rv(r,"Close")); pc=float(df["Close"].iloc[-2])
         liq_ok, liq_val, liq_msg = check_liquidity(df, ticker)
         sq   = bool(rv(r,"BB_sq")); rd=bool(rv(r,"RSI_DIV"))
+        rs_pct, rs_out, rs_lbl = get_relative_strength(ticker, lookback_days=30)
         return {
             "ticker":  ticker, "price":round(c,2),
             "chg":     round((c-pc)/pc*100,2),
@@ -1674,8 +1675,8 @@ def quick_screen_one(ticker, regime=None):
             "adx":     round(float(rv(r,"ADX")),1),
             "squeeze": sq, "rsi_div":rd,
             "liquid":  liq_ok,
-            "regime_downgraded": sig["signal"]!=sig.get("raw_signal",sig["signal"]),
-            "rs_pct":  0, "rs_out": False,
+            "regime_downgraded": sig["signal"]!=sig["raw_signal"],
+            "rs_pct":  rs_pct, "rs_out": rs_out,
         }
     except Exception as e:
         return {"ticker":ticker,"error":str(e)[:50]}
@@ -1858,14 +1859,13 @@ def run_full_analysis(chat_id, ticker, timeframe="1d", tf_label="Daily"):
         mtf = None
         weekly_lag = None
         if timeframe == "1d":
-            send(chat_id, "🔄 Checking weekly timeframes...")
+            send(chat_id, "🔄 Checking weekly/monthly timeframes...")
             try:
                 mtf = multi_timeframe_consensus(ticker)
-                wk  = mtf[0].get("Weekly") if mtf else None
+                wk  = mtf[0].get("Weekly")
                 if wk: weekly_lag = wk.get("lag_obj")
             except Exception as e:
                 log.warning(f"MTF failed for {ticker}: {e}")
-                mtf = None
 
         # 4. Build signal with all filters
         sig = build_signal(dd, lead, lag,
