@@ -236,10 +236,14 @@ def get_relative_strength(ticker, lookback_days=60):
                        interval="1d",auto_adjust=True)
         if stock_df.empty or index_df.empty or len(stock_df)<5 or len(index_df)<5:
             return 0, False, "RS unavailable"
-        s_ret = (float(stock_df["Close"].iloc[-1]) -
-                 float(stock_df["Close"].iloc[0])) / float(stock_df["Close"].iloc[0]) * 100
-        i_ret = (float(index_df["Close"].iloc[-1]) -
-                 float(index_df["Close"].iloc[0])) / float(index_df["Close"].iloc[0]) * 100
+        # Squeeze to handle MultiIndex columns yfinance sometimes returns
+        sc = stock_df["Close"].squeeze() if "Close" in stock_df.columns else stock_df.iloc[:,3].squeeze()
+        ic = index_df["Close"].squeeze() if "Close" in index_df.columns else index_df.iloc[:,3].squeeze()
+        sc = sc.dropna(); ic = ic.dropna()
+        if len(sc) < 3 or len(ic) < 3:
+            return 0, False, "RS unavailable"
+        s_ret = (float(sc.iloc[-1]) - float(sc.iloc[0])) / float(sc.iloc[0]) * 100
+        i_ret = (float(ic.iloc[-1]) - float(ic.iloc[0])) / float(ic.iloc[0]) * 100
         rs    = round(s_ret - i_ret, 2)
         out   = rs > 0
         label = (f"{'Outperforming' if out else 'Underperforming'} {index_ticker} "
@@ -1432,17 +1436,17 @@ def fmt_full_analysis(ticker, dd, lead, lag, sig, fund, pats,
     chg_s=f"{'↑' if chg>=0 else '↓'}{abs(chg):.2f}%"
 
     lines=[
-        f"*{ticker}* — {fund.get('name',ticker)}",
+        f"<b>{ticker}</b> — {fund.get('name',ticker)}",
         f"{cs}{c:,.2f}  {chg_s}  │  {fund.get('sector','—')}  │  {fund.get('exchange','—')}",
         f"MCap: {fund.get('market_cap','—')}  │  P/E: {fund.get('pe','—')}  "
         f"│  Beta: {fund.get('beta','—')}  │  Div: {fund.get('div','—')}",
         "",
-        f"{sig['emoji']} *{sig['signal']}*  {SCORE_BAR.get(sig['signal'],'▱▱▱▱▱')}  "
+        f"{sig['emoji']} <b>{sig['signal']}</b>  {SCORE_BAR.get(sig['signal'],'▱▱▱▱▱')}  "
         f"({timeframe})",
         f"📋 {sig['strategy']}  │  ⏱ {sig['horizon']}",
         f"🗓 Signal valid till: {sig.get('valid_till','—')}",
         "",
-        f"*{setup_status(lead['score'],lag['score'],sig['signal'])}*",
+        f"<b>{setup_status(lead['score'],lag['score'],sig['signal'])}</b>",
         "",
     ]
 
@@ -1456,7 +1460,7 @@ def fmt_full_analysis(ticker, dd, lead, lag, sig, fund, pats,
     if rs_label:
         rs_icon = "⭐" if rs_out and regime_str in ("bear","neutral") else ""
         if rs_icon:
-            lines += [f"{rs_icon} *OUTPERFORMING market in adverse regime* — {rs_label}", ""]
+            lines += [f"{rs_icon} <b>OUTPERFORMING market in adverse regime</b> — {rs_label}", ""]
         else:
             lines += [f"📊 {rs_label}", ""]
 
@@ -1475,9 +1479,9 @@ def fmt_full_analysis(ticker, dd, lead, lag, sig, fund, pats,
     # Scores
     lines+=[
         "━━━ TWO-STAGE SCORES ━━━",
-        f"🔮 *Leading*  (what WILL happen): {score_label(lead['score'])} Grade {lead['grade']}",
+        f"🔮 <b>Leading</b>  (what WILL happen): {score_label(lead['score'])} Grade {lead['grade']}",
         f"   {lead['interpretation']}",
-        f"✅ *Lagging*  (what IS happening): {score_label(lag['score'])} Grade {lag['grade']}",
+        f"✅ <b>Lagging</b>  (what IS happening): {score_label(lag['score'])} Grade {lag['grade']}",
         f"   {lag['interpretation']}",
         f"📊 Combined: {sig['combined']}/100",
         "",
@@ -1485,17 +1489,17 @@ def fmt_full_analysis(ticker, dd, lead, lag, sig, fund, pats,
 
     # Evidence
     if lead["top"]:
-        lines.append("*Leading signals:*")
+        lines.append("<b>Leading signals:</b>")
         for s in lead["top"]: lines.append(f"  ▶ {s}")
     if lead["weak"]:
-        lines.append("*Leading gaps:*")
+        lines.append("<b>Leading gaps:</b>")
         for s in lead["weak"][:2]: lines.append(f"  ✗ {s}")
     lines.append("")
     if lag["top"]:
-        lines.append("*Lagging confirms:*")
+        lines.append("<b>Lagging confirms:</b>")
         for s in lag["top"]: lines.append(f"  ✓ {s}")
     if lag["weak"]:
-        lines.append("*Lagging gaps:*")
+        lines.append("<b>Lagging gaps:</b>")
         for s in lag["weak"][:2]: lines.append(f"  ✗ {s}")
     lines.append("")
 
@@ -1512,16 +1516,16 @@ def fmt_full_analysis(ticker, dd, lead, lag, sig, fund, pats,
             f"📐 ATR:    {cs}{sig['atr']:,.2f}  ({sig['atr_pct']:.1f}% of price)",
         ]
         if sig["signal"] in ("WATCH","WAIT"):
-            lines.append("_⚠️ Indicative only — signal not confirmed, do not act on these levels_")
+            lines.append("<i>⚠️ Indicative only — signal not confirmed, do not act on these levels</i>")
         # Trailing stop guidance
         lines+=[
             "",
-            "_Trailing stop rule:_",
-            f"  _After T1 hit → move SL to breakeven ({cs}{sig['entry']:,.2f})_",
-            f"  _After T2 hit → trail SL to T1 ({cs}{sig['t1']:,.2f})_",
+            "<i>Trailing stop rule:</i>",
+            f"  <i>After T1 hit → move SL to breakeven ({cs}{sig['entry']:,.2f})</i>",
+            f"  <i>After T2 hit → trail SL to T1 ({cs}{sig['t1']:,.2f})</i>",
         ]
     else:
-        lines.append("_No actionable trade levels — signal insufficient_")
+        lines.append("<i>No actionable trade levels — signal insufficient</i>")
     lines.append("")
 
     # Position sizing — with regime adjustment note
@@ -1575,7 +1579,7 @@ def fmt_full_analysis(ticker, dd, lead, lag, sig, fund, pats,
         lines.append("━━━ CANDLESTICK PATTERNS ━━━")
         for p in pats[:5]:
             icon={"bullish":"🟢","bearish":"🔴","warning":"🟡","neutral":"⚪"}.get(p["type"],"⚪")
-            lines.append(f"{icon} *{p['name']}* ({p['conviction']}%) — {p['date']}")
+            lines.append(f"{icon} <b>{p['name']}</b> ({p['conviction']}%) — {p['date']}")
             lines.append(f"   ↳ {p['action']}")
         lines.append("")
 
@@ -1618,7 +1622,7 @@ def fmt_full_analysis(ticker, dd, lead, lag, sig, fund, pats,
         for line in ai_text.split("\n"): lines.append(line)
         lines.append("")
 
-    lines.append(f"_/log {ticker} {c:.0f} 1 to log this trade_")
+    lines.append(f"<i>/log {ticker} {c:.0f} 1 to log this trade</i>")
     return "\n".join(str(l) for l in lines)
 
 
@@ -1630,7 +1634,7 @@ def fmt_trade_row(t):
     sl_note=""
     if t.get("breakeven_set"): sl_note=" (BE)"
     elif t.get("trailing_sl"):  sl_note=f" →{t['trailing_sl']:.2f}"
-    return (f"*#{t['id']} {t['ticker']}*  {outcome}\n"
+    return (f"<b>#{t['id']} {t['ticker']}</b>  {outcome}\n"
             f"  Entry:{t['entry_price']}  SL:{t.get('sl','—')}{sl_note}  T2:{t.get('t2','—')}\n"
             f"  Lead:{t.get('lead_score','—')} Lag:{t.get('lag_score','—')}  "
             f"{t.get('signal_type','—')}  {t.get('entry_date','—')}\n"
@@ -1831,24 +1835,26 @@ def escape_md(text):
     """Escape special MarkdownV2 chars — but we use plain mode instead."""
     return str(text)
 
-def send(chat_id, text, parse_mode=""):
-    """Send message with NO parse mode by default — avoids silent Markdown failures."""
+def send(chat_id, text, parse_mode="HTML"):
+    """Send with HTML formatting — safer than Markdown, never fails on special chars."""
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
     for chunk in chunks:
         result = tg("sendMessage", data={
             "chat_id":    chat_id,
             "text":       chunk,
-            "parse_mode": parse_mode  # empty = plain text, never fails
+            "parse_mode": parse_mode
         })
         if not result.get("ok"):
-            log.error(f"send() failed: {result.get('description','')}")
+            # If HTML fails, retry as plain text
+            log.error(f"send() HTML failed: {result.get('description','')} — retrying plain")
+            tg("sendMessage", data={"chat_id":chat_id,"text":chunk,"parse_mode":""})
         if len(chunks) > 1:
             time.sleep(0.4)
 
-def send_photo(chat_id,buf,caption="",parse_mode="Markdown"):
+def send_photo(chat_id, buf, caption="", parse_mode="HTML"):
     buf.seek(0)
-    tg("sendPhoto",data={"chat_id":chat_id,"caption":caption[:1024],
-                          "parse_mode":parse_mode},files={"photo":buf})
+    tg("sendPhoto", data={"chat_id":chat_id, "caption":caption[:1024],
+                          "parse_mode":parse_mode}, files={"photo":buf})
 
 def send_typing(chat_id): tg("sendChatAction",data={"chat_id":chat_id,"action":"typing"})
 def send_upload(chat_id): tg("sendChatAction",data={"chat_id":chat_id,"action":"upload_photo"})
@@ -2244,41 +2250,41 @@ def cmd_status(chat_id, args):
          f"{mkt}\n🌍 Market: {regime_s}\n{j}\n🤖 AI: {ai_s}\n\n"
          f"_/help for all commands_")
 
-HELP_TEXT="""*AstraQuant v3.0 — Real Money Edition*
+HELP_TEXT="""<b>AstraQuant v3.0 — Real Money Edition</b>
 Built as if trading with own capital.
 
-📊 *Analysis*
+📊 <b>Analysis</b>
 `/a TCS.NS`  — Daily analysis + chart + all risk checks
 `/a AAPL`    — US/global stocks — any Yahoo Finance symbol
 `/w TCS.NS`  — Weekly analysis + chart
 `/both TCS.NS` — Daily + weekly (2 charts)
 
-🔍 *Screener*
+🔍 <b>Screener</b>
 `/screen`         — Nifty 50 (illiquid auto-filtered)
 `/screen early`   — Early Setup signals
 `/screen prime`   — Prime Long only
 `/screen global AAPL MSFT NVDA` — custom list
 
-📐 *Tools*
+📐 <b>Tools</b>
 `/fib TCS.NS`          — Fibonacci retracement
 `/size TCS.NS 3900 3800` — Position size (1% risk)
 `/regime TCS.NS`       — Market regime for this exchange
 `/portfolio`           — Open trades risk summary
 
-📓 *Journal*
+📓 <b>Journal</b>
 `/log TCS.NS 3900 10`  — Log trade (auto-fills levels)
 `/trades`              — All trades + stats
 `/trades open`         — Open only
 `/close 3 3950`        — Close trade #3
 `/trail 3 3800`        — Update trailing stop
 
-🔔 *Alerts*
+🔔 <b>Alerts</b>
 `/alert TCS.NS above 4000`
 `/alerts`
 
 ℹ️  `/status`  `/help`
 
-*Real-money filters active on every signal:*
+<b>Real-money filters active on every signal:</b>
 🌍 Market regime filter (bear = no new longs)
 💧 Liquidity gate (min daily turnover enforced)
 📅 Earnings blackout (5-day window before earnings)
