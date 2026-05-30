@@ -55,6 +55,24 @@ def _load_env():
 
 _load_env()
 
+# ── Ticker info cache — one .info call shared across fund/earnings ────
+_info_cache = {}
+_INFO_TTL   = 300
+
+def get_ticker_info(ticker):
+    now = time.time()
+    cached = _info_cache.get(ticker)
+    if cached and now - cached[0] < _INFO_TTL:
+        return cached[1]
+    try:
+        info = yf.Ticker(ticker).info
+        _info_cache[ticker] = (now, info)
+        return info
+    except Exception as e:
+        log.warning(f"get_ticker_info {ticker}: {e}")
+        return {}
+
+
 # ── Required ─────────────────────────────────────────────────────────
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 YOUR_CHAT_ID = os.environ.get("CHAT_ID", "")
@@ -271,9 +289,9 @@ def get_market_regime(ticker):
 
     try:
         end   = datetime.today() + timedelta(days=1)
-        start = end - timedelta(days=365)
-        idx   = yf.Ticker(index_ticker)
-        df    = idx.history(start=start, end=end, interval="1d", auto_adjust=True)
+        start = end - timedelta(days=252)
+        df    = yf.Ticker(index_ticker).history(start=start, end=end,
+                    interval="1d", auto_adjust=True)
         if df.empty or len(df) < 50:
             return ("neutral", 50, f"Cannot fetch {index_ticker} — assuming neutral")
 
@@ -344,7 +362,7 @@ def check_earnings_risk(ticker):
     Returns (is_risky, days_to_earnings, message)
     """
     try:
-        info = yf.Ticker(ticker).info
+        info = get_ticker_info(ticker)
         ts   = info.get("earningsTimestamp")
         if not ts: return False, None, "No upcoming earnings data"
         earnings_dt = datetime.fromtimestamp(int(ts))
@@ -889,7 +907,7 @@ def fetch_and_score(ticker, interval="1d"):
 
 def get_fund(ticker):
     try:
-        info=yf.Ticker(ticker).info
+        info=get_ticker_info(ticker)
         def g(k,d="—"):
             v=info.get(k,d); return d if v is None else v
         mc=g("marketCap")
@@ -1084,7 +1102,8 @@ RISK: [the single biggest real-money risk]
 BIAS: [3-5 words]"""
         r=client.chat.completions.create(model=AI_MODEL,
             messages=[{"role":"user","content":prompt}],
-            max_tokens=220,temperature=0.3)
+            max_tokens=220,
+            timeout=15,temperature=0.3)
         return r.choices[0].message.content.strip()
     except Exception as e:
         log.error(f"AI error: {e}"); return None
@@ -1904,17 +1923,31 @@ def run_full_analysis(chat_id, ticker, timeframe="1d", tf_label="Daily"):
                            regime=regime,
                            weekly_lag=weekly_lag)
 
-        # 5. Risk checks
-        fund          = get_fund(ticker)
-        sig["cs"]     = fund.get("cs","")
-        liq_ok, liq_v, liq_msg   = check_liquidity(dd, ticker)
-        earn_risk, _, earn_msg   = check_earnings_risk(ticker)
-        gap_risk, _, _, gap_msg  = assess_gap_risk(dd)
-        fib, sh, sl_f            = fibonacci_levels(dd)
-        supports, resistances    = find_sr_levels(dd)
-        pats                     = candle_patterns(dd, n_bars=14)
-        rs_pct, rs_out, rs_label = get_relative_strength(ticker, lookback_days=30)
+        # 5. Risk checks — fast local first, then concurrent network calls
+        liq_ok, liq_v, liq_msg  = check_liquidity(dd, ticker)
+        gap_risk, _, _, gap_msg = assess_gap_risk(dd)
+        fib, sh, sl_f           = fibonacci_levels(dd)
+        supports, resistances   = find_sr_levels(dd)
+        pats                    = candle_patterns(dd, n_bars=14)
 
+        # Single .info fetch shared by fund + earnings (via cache)
+        get_ticker_info(ticker)
+        fund_r=[{}]; earn_r=[(False,None,"—")]; rs_r=[(0,False,"RS unavailable")]
+        def _tf():
+            try: fund_r[0]=get_fund(ticker)
+            except: pass
+        def _te():
+            try: earn_r[0]=check_earnings_risk(ticker)
+            except: pass
+        def _tr():
+            try: rs_r[0]=get_relative_strength(ticker,lookback_days=30)
+            except: pass
+        _ts=[threading.Thread(target=f,daemon=True) for f in [_tf,_te,_tr]]
+        for _t in _ts: _t.start()
+        for _t in _ts: _t.join(timeout=10)
+        fund=fund_r[0]; sig["cs"]=fund.get("cs","")
+        earn_risk,_,earn_msg=earn_r[0]
+        rs_pct,rs_out,rs_label=rs_r[0]
         # 6. Portfolio risk
         sector = fund.get("sector","—")
         blocked, block_reasons, open_c, sec_c, port_risk = (
